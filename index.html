@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Schwebungsmesser Pro (Bandpass & Steilheit)</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --accent: #38bdf8;
+      --text: #f8fafc;
+      --subtext: #94a3b8;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      justify-content: center;
+      padding: 20px;
+      margin: 0;
+    }
+
+    .container {
+      background: var(--card);
+      border-radius: 16px;
+      padding: 24px;
+      max-width: 600px;
+      width: 100%;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    }
+
+    h1 {
+      margin-top: 0;
+      color: var(--accent);
+      text-align: center;
+      font-size: 1.4rem;
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .input-group {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-bottom: 12px;
+    }
+
+    label { font-size: 0.8rem; color: var(--subtext); }
+    input, select {
+      background: #0f172a;
+      border: 1px solid #334155;
+      color: #fff;
+      padding: 10px 12px;
+      border-radius: 6px;
+      font-weight: bold;
+      font-size: 0.95rem;
+    }
+
+    input:focus, select:focus {
+      outline: 1px solid var(--accent);
+    }
+
+    .dashboard {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin: 16px 0;
+    }
+
+    .metric-card {
+      background: #0f172a;
+      border-radius: 12px;
+      padding: 16px;
+      text-align: center;
+      border: 1px solid #334155;
+    }
+
+    .metric-title { font-size: 0.8rem; color: var(--subtext); text-transform: uppercase; }
+    .metric-value { font-size: 2.2rem; font-weight: bold; color: var(--accent); margin-top: 4px; }
+
+    button {
+      width: 100%;
+      padding: 14px;
+      border: none;
+      border-radius: 8px;
+      font-weight: bold;
+      font-size: 1rem;
+      cursor: pointer;
+      background: var(--accent);
+      color: #0f172a;
+      transition: all 0.2s ease;
+    }
+
+    button.recording { background: #ef4444; color: #fff; }
+
+    canvas {
+      width: 100%;
+      height: 150px;
+      background: #000;
+      border-radius: 8px;
+      display: block;
+      margin-top: 16px;
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <h1>🎙️ Schwebungsmesser (Bandpass)</h1>
+
+  <!-- 1. Frequenzfenster -->
+  <div class="grid-2">
+    <div class="input-group">
+      <label for="minFreq">Min. Frequenz (Hz):</label>
+      <input type="number" id="minFreq" value="430" step="1" min="20" max="8000">
+    </div>
+    <div class="input-group">
+      <label for="maxFreq">Max. Frequenz (Hz):</label>
+      <input type="number" id="maxFreq" value="450" step="1" min="20" max="8000">
+    </div>
+  </div>
+
+  <!-- 2. Intensität des Abschneidens (Steilheit) -->
+  <div class="input-group">
+    <label for="steepnessSelect">Filter-Steilheit (Abschneid-Intensität):</label>
+    <select id="steepnessSelect">
+      <option value="1">12 dB/Okt (Weich - breiter Übergang)</option>
+      <option value="2">24 dB/Okt (Mittel - ausgewogen)</option>
+      <option value="3">36 dB/Okt (Stark - gute Isolation)</option>
+      <option value="4" selected>48 dB/Okt (Rigoros - maximale Isolation)</option>
+    </select>
+  </div>
+
+  <button id="startBtn">▶ Messung Starten</button>
+
+  <div class="dashboard">
+    <div class="metric-card">
+      <div class="metric-title">Schwebung Frequenz</div>
+      <div class="metric-value" id="beatHz">0.00 <small style="font-size:1rem">Hz</small></div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-title">Schwebungen / Min</div>
+      <div class="metric-value" id="beatBpm">0 <small style="font-size:1rem">BPM</small></div>
+    </div>
+  </div>
+
+  <canvas id="envelopeScope"></canvas>
+</div>
+
+<script>
+let audioCtx;
+let stream;
+let isRunning = false;
+let analyserNode;
+let sourceNode;
+let filterNodes = [];
+let animId;
+
+const startBtn = document.getElementById('startBtn');
+const minFreqInput = document.getElementById('minFreq');
+const maxFreqInput = document.getElementById('maxFreq');
+const steepnessSelect = document.getElementById('steepnessSelect');
+const beatHzEl = document.getElementById('beatHz');
+const beatBpmEl = document.getElementById('beatBpm');
+const canvas = document.getElementById('envelopeScope');
+const ctx = canvas.getContext('2d');
+
+canvas.width = canvas.offsetWidth;
+canvas.height = canvas.offsetHeight;
+
+const envHistory = new Float32Array(1024);
+let envPtr = 0;
+
+// Reagiert dynamisch auf Eingabeänderungen
+minFreqInput.addEventListener('input', updateFilterChain);
+maxFreqInput.addEventListener('input', updateFilterChain);
+steepnessSelect.addEventListener('change', rebuildAudioPipeline);
+
+startBtn.addEventListener('click', async () => {
+  if (isRunning) {
+    stopAnalysis();
+  } else {
+    await startAnalysis();
+  }
+});
+
+async function startAnalysis() {
+  const minF = parseFloat(minFreqInput.value);
+  const maxF = parseFloat(maxFreqInput.value);
+
+  if (minF >= maxF) {
+    alert("Min. Frequenz muss kleiner sein als Max. Frequenz!");
+    return;
+  }
+
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+    
+    // Rohes Mikrofon-Signal
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+
+    sourceNode = audioCtx.createMediaStreamSource(stream);
+    analyserNode = audioCtx.createAnalyser();
+    analyserNode.fftSize = 2048;
+
+    buildFilterChain();
+
+    isRunning = true;
+    startBtn.textContent = "⏹ Stopp";
+    startBtn.classList.add('recording');
+
+    processAudio();
+  } catch (e) {
+    alert("Mikrofonfehler: " + e.message);
+  }
+}
+
+// Baut die Filter-Kette basierend auf Min, Max und Steilheit auf
+function buildFilterChain() {
+  if (!audioCtx || !sourceNode) return;
+
+  // Alte Verbindungen trennen
+  sourceNode.disconnect();
+  filterNodes.forEach(f => f.disconnect());
+  filterNodes = [];
+
+  const minF = parseFloat(minFreqInput.value) || 20;
+  const maxF = parseFloat(maxFreqInput.value) || 20000;
+  const cascades = parseInt(steepnessSelect.value); // 1-4 Kaskaden
+
+  let lastNode = sourceNode;
+
+  // Hochpass-Kaskade (Min-Frequenz schneidet tiefere Töne ab)
+  for (let i = 0; i < cascades; i++) {
+    const hp = audioCtx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.setValueAtTime(minF, audioCtx.currentTime);
+    lastNode.connect(hp);
+    filterNodes.push(hp);
+    lastNode = hp;
+  }
+
+  // Tiefpass-Kaskade (Max-Frequenz schneidet höhere Töne ab)
+  for (let i = 0; i < cascades; i++) {
+    const lp = audioCtx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(maxF, audioCtx.currentTime);
+    lastNode.connect(lp);
+    filterNodes.push(lp);
+    lastNode = lp;
+  }
+
+  lastNode.connect(analyserNode);
+}
+
+function updateFilterChain() {
+  if (!audioCtx || filterNodes.length === 0) return;
+  const minF = parseFloat(minFreqInput.value) || 20;
+  const maxF = parseFloat(maxFreqInput.value) || 20000;
+
+  if (minF >= maxF) return;
+
+  filterNodes.forEach(node => {
+    if (node.type === 'highpass') node.frequency.setValueAtTime(minF, audioCtx.currentTime);
+    if (node.type === 'lowpass') node.frequency.setValueAtTime(maxF, audioCtx.currentTime);
+  });
+}
+
+function rebuildAudioPipeline() {
+  if (isRunning) buildFilterChain();
+}
+
+function stopAnalysis() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (audioCtx) audioCtx.close();
+  cancelAnimationFrame(animId);
+  isRunning = false;
+  startBtn.textContent = "▶ Messung Starten";
+  startBtn.classList.remove('recording');
+}
+
+function processAudio() {
+  if (!isRunning) return;
+
+  const bufferLength = analyserNode.fftSize;
+  const timeData = new Float32Array(bufferLength);
+  analyserNode.getFloatTimeDomainData(timeData);
+
+  // RMS-Hüllkurvenwert
+  let sum = 0;
+  for (let i = 0; i < timeData.length; i++) sum += timeData[i] * timeData[i];
+  const rms = Math.sqrt(sum / timeData.length);
+
+  envHistory[envPtr] = rms;
+  envPtr = (envPtr + 1) % envHistory.length;
+
+  const frameRate = audioCtx.sampleRate / bufferLength;
+
+  // Schwebung berechnen
+  const beatFreq = calculateBeatFrequency(envHistory, frameRate);
+
+  if (beatFreq > 0.1 && beatFreq < 15) {
+    beatHzEl.textContent = beatFreq.toFixed(2) + " Hz";
+    beatBpmEl.textContent = Math.round(beatFreq * 60) + " BPM";
+  } else {
+    beatHzEl.textContent = "0.00 Hz";
+    beatBpmEl.textContent = "0 BPM";
+  }
+
+  drawScope(envHistory, envPtr);
+  animId = requestAnimationFrame(processAudio);
+}
+
+function calculateBeatFrequency(history, frameRate) {
+  const n = history.length;
+  let mean = 0;
+  for (let i = 0; i < n; i++) mean += history[i];
+  mean /= n;
+
+  const ac = new Float32Array(Math.floor(n / 2));
+  for (let lag = 0; lag < ac.length; lag++) {
+    let sum = 0;
+    for (let i = 0; i < n - lag; i++) {
+      sum += (history[i] - mean) * (history[i + lag] - mean);
+    }
+    ac[lag] = sum;
+  }
+
+  let peakLag = -1;
+  let maxVal = 0;
+  for (let lag = 2; lag < ac.length - 1; lag++) {
+    if (ac[lag] > ac[lag - 1] && ac[lag] > ac[lag + 1]) {
+      if (ac[lag] > maxVal) {
+        maxVal = ac[lag];
+        peakLag = lag;
+      }
+    }
+  }
+
+  if (peakLag > 0) return frameRate / peakLag;
+  return 0;
+}
+
+function drawScope(history, currentPtr) {
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "#38bdf8";
+  ctx.beginPath();
+
+  const step = canvas.width / history.length;
+  let maxAmp = 0.0001;
+  for (let i = 0; i < history.length; i++) if (history[i] > maxAmp) maxAmp = history[i];
+
+  for (let i = 0; i < history.length; i++) {
+    const idx = (currentPtr + i) % history.length;
+    const normalized = history[idx] / maxAmp;
+    const y = canvas.height - (normalized * (canvas.height * 0.8) + 10);
+    const x = i * step;
+
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+</script>
+</body>
+</html>
