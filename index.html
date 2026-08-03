@@ -3,12 +3,12 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Schwebungsmesser Pro (Bandpass & Steilheit)</title>
+  <title>Intervall-Schwebungsmesser</title>
   <style>
     :root {
       --bg: #0f172a;
       --card: #1e293b;
-      --accent: #38bdf8;
+      --accent: #a855f7; /* Violett für das neue Tool */
       --text: #f8fafc;
       --subtext: #94a3b8;
     }
@@ -50,7 +50,7 @@
       display: flex;
       flex-direction: column;
       gap: 4px;
-      margin-bottom: 12px;
+      margin-bottom: 16px;
     }
 
     label { font-size: 0.8rem; color: var(--subtext); }
@@ -64,9 +64,19 @@
       font-size: 0.95rem;
     }
 
-    input:focus, select:focus {
-      outline: 1px solid var(--accent);
+    input:focus, select:focus { outline: 1px solid var(--accent); }
+
+    .info-box {
+      background: rgba(168, 85, 247, 0.1);
+      border: 1px solid var(--accent);
+      padding: 12px;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      text-align: center;
+      margin-bottom: 16px;
     }
+
+    .info-box span { font-weight: bold; color: var(--accent); font-size: 1.1rem; }
 
     .dashboard {
       display: grid;
@@ -95,7 +105,7 @@
       font-size: 1rem;
       cursor: pointer;
       background: var(--accent);
-      color: #0f172a;
+      color: #fff;
       transition: all 0.2s ease;
     }
 
@@ -114,29 +124,29 @@
 <body>
 
 <div class="container">
-  <h1>🎙️ Schwebungsmesser (Bandpass)</h1>
+  <h1>🎼 Intervall-Schwebungsmesser</h1>
 
-  <!-- 1. Frequenzfenster -->
   <div class="grid-2">
     <div class="input-group">
-      <label for="minFreq">Min. Frequenz (Hz):</label>
-      <input type="number" id="minFreq" value="430" step="1" min="20" max="8000">
+      <label for="baseFreq">Grundton (Hz):</label>
+      <input type="number" id="baseFreq" value="440" step="0.1">
     </div>
     <div class="input-group">
-      <label for="maxFreq">Max. Frequenz (Hz):</label>
-      <input type="number" id="maxFreq" value="450" step="1" min="20" max="8000">
+      <label for="intervalSelect">Gespieltes Intervall:</label>
+      <select id="intervalSelect">
+        <option value="2,1">Oktave (2:1)</option>
+        <option value="3,2">Quinte (3:2)</option>
+        <option value="4,3">Quarte (4:3)</option>
+        <option value="5,4" selected>Große Terz (5:4)</option>
+        <option value="6,5">Kleine Terz (6:5)</option>
+        <option value="5,3">Große Sexte (5:3)</option>
+      </select>
     </div>
   </div>
 
-  <!-- 2. Intensität des Abschneidens (Steilheit) -->
-  <div class="input-group">
-    <label for="steepnessSelect">Filter-Steilheit (Abschneid-Intensität):</label>
-    <select id="steepnessSelect">
-      <option value="1">12 dB/Okt (Weich - breiter Übergang)</option>
-      <option value="2">24 dB/Okt (Mittel - ausgewogen)</option>
-      <option value="3">36 dB/Okt (Stark - gute Isolation)</option>
-      <option value="4" selected>48 dB/Okt (Rigoros - maximale Isolation)</option>
-    </select>
+  <div class="info-box">
+    Überwachter Oberton-Kollisionspunkt:<br>
+    <span id="targetFreqDisplay">2200 Hz</span>
   </div>
 
   <button id="startBtn">▶ Messung Starten</button>
@@ -161,13 +171,13 @@ let stream;
 let isRunning = false;
 let analyserNode;
 let sourceNode;
-let filterNodes = [];
+let bandpassFilter;
 let animId;
 
 const startBtn = document.getElementById('startBtn');
-const minFreqInput = document.getElementById('minFreq');
-const maxFreqInput = document.getElementById('maxFreq');
-const steepnessSelect = document.getElementById('steepnessSelect');
+const baseFreqInput = document.getElementById('baseFreq');
+const intervalSelect = document.getElementById('intervalSelect');
+const targetFreqDisplay = document.getElementById('targetFreqDisplay');
 const beatHzEl = document.getElementById('beatHz');
 const beatBpmEl = document.getElementById('beatBpm');
 const canvas = document.getElementById('envelopeScope');
@@ -176,44 +186,57 @@ const ctx = canvas.getContext('2d');
 canvas.width = canvas.offsetWidth;
 canvas.height = canvas.offsetHeight;
 
+// Wir speichern 1024 Werte. Bei der neuen, schnelleren Abtastrate reicht das für ca. 11 Sekunden Historie.
 const envHistory = new Float32Array(1024);
 let envPtr = 0;
 
-// Reagiert dynamisch auf Eingabeänderungen
-minFreqInput.addEventListener('input', updateFilterChain);
-maxFreqInput.addEventListener('input', updateFilterChain);
-steepnessSelect.addEventListener('change', rebuildAudioPipeline);
+// Berechnet die Ziel-Frequenz und aktualisiert den Filter
+function updateTargetFrequency() {
+  const baseF = parseFloat(baseFreqInput.value) || 440;
+  const ratios = intervalSelect.value.split(',');
+  const harmonicBase = parseInt(ratios[0]);
+  
+  // Der Kollisionspunkt (z.B. 440 Hz * 5 = 2200 Hz für die große Terz)
+  const targetF = baseF * harmonicBase;
+  targetFreqDisplay.textContent = targetF.toFixed(1) + " Hz";
+
+  if (bandpassFilter && audioCtx) {
+    bandpassFilter.frequency.setValueAtTime(targetF, audioCtx.currentTime);
+  }
+}
+
+baseFreqInput.addEventListener('input', updateTargetFrequency);
+intervalSelect.addEventListener('change', updateTargetFrequency);
+updateTargetFrequency();
 
 startBtn.addEventListener('click', async () => {
-  if (isRunning) {
-    stopAnalysis();
-  } else {
-    await startAnalysis();
-  }
+  if (isRunning) stopAnalysis();
+  else await startAnalysis();
 });
 
 async function startAnalysis() {
-  const minF = parseFloat(minFreqInput.value);
-  const maxF = parseFloat(maxFreqInput.value);
-
-  if (minF >= maxF) {
-    alert("Min. Frequenz muss kleiner sein als Max. Frequenz!");
-    return;
-  }
-
   try {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
     
-    // Rohes Mikrofon-Signal
     stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
     });
 
     sourceNode = audioCtx.createMediaStreamSource(stream);
+    
+    // Ein hochpräziser Bandpass-Filter ("akustische Lupe")
+    bandpassFilter = audioCtx.createBiquadFilter();
+    bandpassFilter.type = 'bandpass';
+    bandpassFilter.Q.value = 15; // Sehr eng fokussiert
+    
     analyserNode = audioCtx.createAnalyser();
-    analyserNode.fftSize = 2048;
+    // Kleinere FFT-Größe = schnellere Updates. Wichtig für schnelle Schwebungen (Terzen schlagen schnell!)
+    analyserNode.fftSize = 512; 
 
-    buildFilterChain();
+    sourceNode.connect(bandpassFilter);
+    bandpassFilter.connect(analyserNode);
+
+    updateTargetFrequency();
 
     isRunning = true;
     startBtn.textContent = "⏹ Stopp";
@@ -223,61 +246,6 @@ async function startAnalysis() {
   } catch (e) {
     alert("Mikrofonfehler: " + e.message);
   }
-}
-
-// Baut die Filter-Kette basierend auf Min, Max und Steilheit auf
-function buildFilterChain() {
-  if (!audioCtx || !sourceNode) return;
-
-  // Alte Verbindungen trennen
-  sourceNode.disconnect();
-  filterNodes.forEach(f => f.disconnect());
-  filterNodes = [];
-
-  const minF = parseFloat(minFreqInput.value) || 20;
-  const maxF = parseFloat(maxFreqInput.value) || 20000;
-  const cascades = parseInt(steepnessSelect.value); // 1-4 Kaskaden
-
-  let lastNode = sourceNode;
-
-  // Hochpass-Kaskade (Min-Frequenz schneidet tiefere Töne ab)
-  for (let i = 0; i < cascades; i++) {
-    const hp = audioCtx.createBiquadFilter();
-    hp.type = 'highpass';
-    hp.frequency.setValueAtTime(minF, audioCtx.currentTime);
-    lastNode.connect(hp);
-    filterNodes.push(hp);
-    lastNode = hp;
-  }
-
-  // Tiefpass-Kaskade (Max-Frequenz schneidet höhere Töne ab)
-  for (let i = 0; i < cascades; i++) {
-    const lp = audioCtx.createBiquadFilter();
-    lp.type = 'lowpass';
-    lp.frequency.setValueAtTime(maxF, audioCtx.currentTime);
-    lastNode.connect(lp);
-    filterNodes.push(lp);
-    lastNode = lp;
-  }
-
-  lastNode.connect(analyserNode);
-}
-
-function updateFilterChain() {
-  if (!audioCtx || filterNodes.length === 0) return;
-  const minF = parseFloat(minFreqInput.value) || 20;
-  const maxF = parseFloat(maxFreqInput.value) || 20000;
-
-  if (minF >= maxF) return;
-
-  filterNodes.forEach(node => {
-    if (node.type === 'highpass') node.frequency.setValueAtTime(minF, audioCtx.currentTime);
-    if (node.type === 'lowpass') node.frequency.setValueAtTime(maxF, audioCtx.currentTime);
-  });
-}
-
-function rebuildAudioPipeline() {
-  if (isRunning) buildFilterChain();
 }
 
 function stopAnalysis() {
@@ -296,7 +264,6 @@ function processAudio() {
   const timeData = new Float32Array(bufferLength);
   analyserNode.getFloatTimeDomainData(timeData);
 
-  // RMS-Hüllkurvenwert
   let sum = 0;
   for (let i = 0; i < timeData.length; i++) sum += timeData[i] * timeData[i];
   const rms = Math.sqrt(sum / timeData.length);
@@ -304,12 +271,12 @@ function processAudio() {
   envHistory[envPtr] = rms;
   envPtr = (envPtr + 1) % envHistory.length;
 
+  // FrameRate = 48000 / 512 = ~93.75 Hz
   const frameRate = audioCtx.sampleRate / bufferLength;
-
-  // Schwebung berechnen
   const beatFreq = calculateBeatFrequency(envHistory, frameRate);
 
-  if (beatFreq > 0.1 && beatFreq < 1000) {
+  // Terzen können in gleichstufiger Stimmung bis zu 25 Hz Schwebung haben, wir erlauben bis 40 Hz
+  if (beatFreq > 0.3 && beatFreq < 40) {
     beatHzEl.textContent = beatFreq.toFixed(2) + " Hz";
     beatBpmEl.textContent = Math.round(beatFreq * 60) + " BPM";
   } else {
@@ -356,7 +323,7 @@ function drawScope(history, currentPtr) {
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   ctx.lineWidth = 2;
-  ctx.strokeStyle = "#38bdf8";
+  ctx.strokeStyle = "#a855f7";
   ctx.beginPath();
 
   const step = canvas.width / history.length;
@@ -368,7 +335,6 @@ function drawScope(history, currentPtr) {
     const normalized = history[idx] / maxAmp;
     const y = canvas.height - (normalized * (canvas.height * 0.8) + 10);
     const x = i * step;
-
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   }
