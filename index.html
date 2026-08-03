@@ -309,7 +309,7 @@ function processAudio() {
   // Schwebung berechnen
   const beatFreq = calculateBeatFrequency(envHistory, frameRate);
 
-  if (beatFreq > 0.1 && beatFreq < 15) {
+  if (beatFreq > 0.1 && beatFreq < 1000) {
     beatHzEl.textContent = beatFreq.toFixed(2) + " Hz";
     beatBpmEl.textContent = Math.round(beatFreq * 60) + " BPM";
   } else {
