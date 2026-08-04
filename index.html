@@ -3,12 +3,12 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Intervall-Schwebungsmesser</title>
+  <title>Klavier-Schwebungsmesser (Pro)</title>
   <style>
     :root {
       --bg: #0f172a;
       --card: #1e293b;
-      --accent: #a855f7; /* Violett für das neue Tool */
+      --accent: #10b981; /* Smaragdgrün für den Pro-Modus */
       --text: #f8fafc;
       --subtext: #94a3b8;
     }
@@ -27,7 +27,7 @@
       background: var(--card);
       border-radius: 16px;
       padding: 24px;
-      max-width: 600px;
+      max-width: 650px;
       width: 100%;
       box-shadow: 0 10px 30px rgba(0,0,0,0.5);
     }
@@ -53,7 +53,7 @@
       margin-bottom: 16px;
     }
 
-    label { font-size: 0.8rem; color: var(--subtext); }
+    label { font-size: 0.85rem; color: var(--subtext); }
     input, select {
       background: #0f172a;
       border: 1px solid #334155;
@@ -67,13 +67,14 @@
     input:focus, select:focus { outline: 1px solid var(--accent); }
 
     .info-box {
-      background: rgba(168, 85, 247, 0.1);
+      background: rgba(16, 185, 129, 0.1);
       border: 1px solid var(--accent);
       padding: 12px;
       border-radius: 8px;
-      font-size: 0.85rem;
+      font-size: 0.9rem;
       text-align: center;
       margin-bottom: 16px;
+      line-height: 1.4;
     }
 
     .info-box span { font-weight: bold; color: var(--accent); font-size: 1.1rem; }
@@ -91,10 +92,17 @@
       padding: 16px;
       text-align: center;
       border: 1px solid #334155;
+      position: relative;
     }
 
-    .metric-title { font-size: 0.8rem; color: var(--subtext); text-transform: uppercase; }
+    .metric-title { font-size: 0.8rem; color: var(--subtext); text-transform: uppercase; letter-spacing: 0.5px;}
     .metric-value { font-size: 2.2rem; font-weight: bold; color: var(--accent); margin-top: 4px; }
+    
+    .status-indicator {
+      font-size: 0.75rem;
+      color: #64748b;
+      margin-top: 8px;
+    }
 
     button {
       width: 100%;
@@ -102,7 +110,7 @@
       border: none;
       border-radius: 8px;
       font-weight: bold;
-      font-size: 1rem;
+      font-size: 1.05rem;
       cursor: pointer;
       background: var(--accent);
       color: #fff;
@@ -113,18 +121,19 @@
 
     canvas {
       width: 100%;
-      height: 150px;
+      height: 160px;
       background: #000;
       border-radius: 8px;
       display: block;
       margin-top: 16px;
+      border: 1px solid #334155;
     }
   </style>
 </head>
 <body>
 
 <div class="container">
-  <h1>🎼 Intervall-Schwebungsmesser</h1>
+  <h1>🎹 Klavier-Schwebungsmesser</h1>
 
   <div class="grid-2">
     <div class="input-group">
@@ -145,23 +154,27 @@
   </div>
 
   <div class="info-box">
-    Überwachter Oberton-Kollisionspunkt:<br>
-    <span id="targetFreqDisplay">2200 Hz</span>
+    Überwachter Kollisionspunkt (Oberton):<br>
+    <span id="targetFreqDisplay">2200 Hz</span><br>
+    <small style="color:var(--subtext)">Der Bandpassfilter isoliert exakt diese Frequenz.</small>
   </div>
 
-  <button id="startBtn">▶ Messung Starten</button>
+  <button id="startBtn">▶ Mikrofon & Messung Starten</button>
 
   <div class="dashboard">
     <div class="metric-card">
       <div class="metric-title">Schwebung Frequenz</div>
       <div class="metric-value" id="beatHz">0.00 <small style="font-size:1rem">Hz</small></div>
+      <div class="status-indicator" id="statusText">Warte auf Anschlag...</div>
     </div>
     <div class="metric-card">
       <div class="metric-title">Schwebungen / Min</div>
       <div class="metric-value" id="beatBpm">0 <small style="font-size:1rem">BPM</small></div>
+      <div class="status-indicator">Tempo der Welle</div>
     </div>
   </div>
 
+  <label style="margin-top: 10px; display:block;">Isolierte Schwebungswelle (ohne Lautstärkeabfall):</label>
   <canvas id="envelopeScope"></canvas>
 </div>
 
@@ -169,9 +182,10 @@
 let audioCtx;
 let stream;
 let isRunning = false;
-let analyserNode;
 let sourceNode;
 let bandpassFilter;
+let processorNode;
+let dummyGain;
 let animId;
 
 const startBtn = document.getElementById('startBtn');
@@ -180,23 +194,32 @@ const intervalSelect = document.getElementById('intervalSelect');
 const targetFreqDisplay = document.getElementById('targetFreqDisplay');
 const beatHzEl = document.getElementById('beatHz');
 const beatBpmEl = document.getElementById('beatBpm');
+const statusText = document.getElementById('statusText');
 const canvas = document.getElementById('envelopeScope');
 const ctx = canvas.getContext('2d');
 
 canvas.width = canvas.offsetWidth;
 canvas.height = canvas.offsetHeight;
 
-// Wir speichern 1024 Werte. Bei der neuen, schnelleren Abtastrate reicht das für ca. 11 Sekunden Historie.
-const envHistory = new Float32Array(1024);
-let envPtr = 0;
+// --- AUDIO PROCESSING VARIABLEN ---
+const BUFFER_SIZE = 512; 
+const HISTORY_LEN = 256; // Reicht für knapp 3 Sekunden Hüllkurve
+let envelopeRate = 0; // Wird basierend auf SampleRate berechnet (z.B. 48000/512 = 93.75 Hz)
 
-// Berechnet die Ziel-Frequenz und aktualisiert den Filter
+// Ringpuffer für die Daten
+const rawEnvHistory = new Float32Array(HISTORY_LEN);
+const detrendedHistory = new Float32Array(HISTORY_LEN);
+let historyPtr = 0;
+
+// Variablen für den DC-Blocker (Filtert den Klavier-Abfall weg)
+let prevRaw = 0;
+let prevDetrended = 0;
+
 function updateTargetFrequency() {
   const baseF = parseFloat(baseFreqInput.value) || 440;
   const ratios = intervalSelect.value.split(',');
   const harmonicBase = parseInt(ratios[0]);
   
-  // Der Kollisionspunkt (z.B. 440 Hz * 5 = 2200 Hz für die große Terz)
   const targetF = baseF * harmonicBase;
   targetFreqDisplay.textContent = targetF.toFixed(1) + " Hz";
 
@@ -216,25 +239,61 @@ startBtn.addEventListener('click', async () => {
 
 async function startAnalysis() {
   try {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    envelopeRate = audioCtx.sampleRate / BUFFER_SIZE; // ca. 93 Hz
     
     stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+      audio: { 
+        echoCancellation: false, 
+        noiseSuppression: false, 
+        autoGainControl: false // WICHTIG! AGC würde den echten Hüllkurvenverlauf verfälschen
+      }
     });
 
     sourceNode = audioCtx.createMediaStreamSource(stream);
     
-    // Ein hochpräziser Bandpass-Filter ("akustische Lupe")
+    // Akustische Lupe: Isolierter Bandpass
     bandpassFilter = audioCtx.createBiquadFilter();
     bandpassFilter.type = 'bandpass';
-    bandpassFilter.Q.value = 15; // Sehr eng fokussiert
+    bandpassFilter.Q.value = 25; // Sehr eng, um benachbarte Saiten auszublenden
     
-    analyserNode = audioCtx.createAnalyser();
-    // Kleinere FFT-Größe = schnellere Updates. Wichtig für schnelle Schwebungen (Terzen schlagen schnell!)
-    analyserNode.fftSize = 512; 
+    // Prozessor-Node für sample-genaues Verarbeiten der Hüllkurve
+    processorNode = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
+    
+    processorNode.onaudioprocess = function(e) {
+      const input = e.inputBuffer.getChannelData(0);
+      
+      // 1. RMS (Lautstärke) des aktuellen kurzen Puffer-Abschnitts berechnen
+      let sum = 0;
+      for (let i = 0; i < input.length; i++) {
+        sum += input[i] * input[i];
+      }
+      const rms = Math.sqrt(sum / input.length);
+      
+      // 2. DC-Blocker anwenden (Klavier-Abfall herausfiltern)
+      // Formel: y[n] = x[n] - x[n-1] + R * y[n-1]
+      // R = 0.98 lässt schnelle Schwebungen durch, blockiert aber langsames Abklingen
+      const R = 0.98; 
+      const detrended = rms - prevRaw + R * prevDetrended;
+      
+      prevRaw = rms;
+      prevDetrended = detrended;
+      
+      // 3. Im Ringpuffer speichern
+      rawEnvHistory[historyPtr] = rms;
+      detrendedHistory[historyPtr] = detrended;
+      historyPtr = (historyPtr + 1) % HISTORY_LEN;
+    };
 
+    // Stummes Ziel erstellen (damit der Prozessor im Hintergrund läuft)
+    dummyGain = audioCtx.createGain();
+    dummyGain.gain.value = 0;
+
+    // Verkabelung
     sourceNode.connect(bandpassFilter);
-    bandpassFilter.connect(analyserNode);
+    bandpassFilter.connect(processorNode);
+    processorNode.connect(dummyGain);
+    dummyGain.connect(audioCtx.destination);
 
     updateTargetFrequency();
 
@@ -242,7 +301,8 @@ async function startAnalysis() {
     startBtn.textContent = "⏹ Stopp";
     startBtn.classList.add('recording');
 
-    processAudio();
+    // Visuellen Loop starten
+    updateUI();
   } catch (e) {
     alert("Mikrofonfehler: " + e.message);
   }
@@ -253,88 +313,120 @@ function stopAnalysis() {
   if (audioCtx) audioCtx.close();
   cancelAnimationFrame(animId);
   isRunning = false;
-  startBtn.textContent = "▶ Messung Starten";
+  startBtn.textContent = "▶ Mikrofon & Messung Starten";
   startBtn.classList.remove('recording');
 }
 
-function processAudio() {
+function updateUI() {
   if (!isRunning) return;
 
-  const bufferLength = analyserNode.fftSize;
-  const timeData = new Float32Array(bufferLength);
-  analyserNode.getFloatTimeDomainData(timeData);
-
-  let sum = 0;
-  for (let i = 0; i < timeData.length; i++) sum += timeData[i] * timeData[i];
-  const rms = Math.sqrt(sum / timeData.length);
-
-  envHistory[envPtr] = rms;
-  envPtr = (envPtr + 1) % envHistory.length;
-
-  // FrameRate = 48000 / 512 = ~93.75 Hz
-  const frameRate = audioCtx.sampleRate / bufferLength;
-  const beatFreq = calculateBeatFrequency(envHistory, frameRate);
-
-  // Terzen können in gleichstufiger Stimmung bis zu 25 Hz Schwebung haben, wir erlauben bis 40 Hz
-  if (beatFreq > 0.3 && beatFreq < 40) {
-    beatHzEl.textContent = beatFreq.toFixed(2) + " Hz";
-    beatBpmEl.textContent = Math.round(beatFreq * 60) + " BPM";
-  } else {
-    beatHzEl.textContent = "0.00 Hz";
-    beatBpmEl.textContent = "0 BPM";
-  }
-
-  drawScope(envHistory, envPtr);
-  animId = requestAnimationFrame(processAudio);
+  // Analysiere das detrended Signal (die reine Schwebung)
+  analyzeBeat();
+  
+  // Zeichne das Oszilloskop
+  drawScope();
+  
+  animId = requestAnimationFrame(updateUI);
 }
 
-function calculateBeatFrequency(history, frameRate) {
-  const n = history.length;
-  let mean = 0;
-  for (let i = 0; i < n; i++) mean += history[i];
-  mean /= n;
+function analyzeBeat() {
+  // Überprüfe, ob überhaupt ein Ton gespielt wird (anhand der rohen Lautstärke)
+  let maxRaw = 0;
+  for (let i = 0; i < HISTORY_LEN; i++) {
+    if (rawEnvHistory[i] > maxRaw) maxRaw = rawEnvHistory[i];
+  }
 
-  const ac = new Float32Array(Math.floor(n / 2));
-  for (let lag = 0; lag < ac.length; lag++) {
+  // Schwellenwert: Wenn es zu leise ist, nichts berechnen
+  if (maxRaw < 0.005) {
+    statusText.textContent = "Warte auf Anschlag...";
+    statusText.style.color = "#64748b";
+    return;
+  }
+  
+  statusText.textContent = "Analysiere Schwebung...";
+  statusText.style.color = "var(--accent)";
+
+  // Autokorrelation auf dem gefilterten (detrended) Signal ausführen
+  let maxAc = 0;
+  let peakLag = -1;
+  
+  // Wir suchen nach Schwebungen zwischen 0.5 Hz und 40 Hz
+  const minLag = Math.floor(envelopeRate / 40); // z.B. 93 / 40 = 2 Samples
+  const maxLag = Math.floor(envelopeRate / 0.5); // z.B. 93 / 0.5 = 186 Samples
+  
+  // Kopiere den Ringpuffer in ein lineares Array für die einfache Berechnung
+  const linearBuffer = new Float32Array(HISTORY_LEN);
+  for(let i = 0; i < HISTORY_LEN; i++) {
+    linearBuffer[i] = detrendedHistory[(historyPtr + i) % HISTORY_LEN];
+  }
+
+  // Autokorrelation (findet das sich wiederholende Muster)
+  const ac = new Float32Array(maxLag);
+  for (let lag = minLag; lag < maxLag && lag < HISTORY_LEN / 2; lag++) {
     let sum = 0;
-    for (let i = 0; i < n - lag; i++) {
-      sum += (history[i] - mean) * (history[i + lag] - mean);
+    for (let i = 0; i < HISTORY_LEN - lag; i++) {
+      sum += linearBuffer[i] * linearBuffer[i + lag];
     }
     ac[lag] = sum;
   }
 
-  let peakLag = -1;
-  let maxVal = 0;
-  for (let lag = 2; lag < ac.length - 1; lag++) {
+  // Höchsten Peak finden (Periodenlänge)
+  for (let lag = minLag + 1; lag < ac.length - 1; lag++) {
     if (ac[lag] > ac[lag - 1] && ac[lag] > ac[lag + 1]) {
-      if (ac[lag] > maxVal) {
-        maxVal = ac[lag];
+      if (ac[lag] > maxAc) {
+        maxAc = ac[lag];
         peakLag = lag;
       }
     }
   }
 
-  if (peakLag > 0) return frameRate / peakLag;
-  return 0;
+  // Ausgabe aktualisieren
+  if (peakLag > 0) {
+    const beatFreq = envelopeRate / peakLag;
+    // Glätten der Anzeige (springt sonst zu stark)
+    const currentHz = parseFloat(beatHzEl.textContent) || 0;
+    const smoothedHz = currentHz === 0 ? beatFreq : (currentHz * 0.8 + beatFreq * 0.2);
+    
+    beatHzEl.textContent = smoothedHz.toFixed(2) + " Hz";
+    beatBpmEl.textContent = Math.round(smoothedHz * 60) + " BPM";
+  }
 }
 
-function drawScope(history, currentPtr) {
-  ctx.fillStyle = "#000";
+function drawScope() {
+  ctx.fillStyle = "#0f172a";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+  // Mittellinie zeichnen
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = "#334155";
+  ctx.beginPath();
+  ctx.moveTo(0, canvas.height / 2);
+  ctx.lineTo(canvas.width, canvas.height / 2);
+  ctx.stroke();
+
   ctx.lineWidth = 2;
-  ctx.strokeStyle = "#a855f7";
+  ctx.strokeStyle = "var(--accent)";
   ctx.beginPath();
 
-  const step = canvas.width / history.length;
-  let maxAmp = 0.0001;
-  for (let i = 0; i < history.length; i++) if (history[i] > maxAmp) maxAmp = history[i];
+  const step = canvas.width / HISTORY_LEN;
+  
+  // Automatische Skalierung für die Wellenhöhe
+  let maxDetrended = 0.0001;
+  for (let i = 0; i < HISTORY_LEN; i++) {
+    const val = Math.abs(detrendedHistory[i]);
+    if (val > maxDetrended) maxDetrended = val;
+  }
 
-  for (let i = 0; i < history.length; i++) {
-    const idx = (currentPtr + i) % history.length;
-    const normalized = history[idx] / maxAmp;
-    const y = canvas.height - (normalized * (canvas.height * 0.8) + 10);
+  // Zeichne den Graphen (Rolle den Ringpuffer ab)
+  for (let i = 0; i < HISTORY_LEN; i++) {
+    const idx = (historyPtr + i) % HISTORY_LEN;
+    const val = detrendedHistory[idx];
+    
+    // Normalisieren und zentrieren
+    const normalized = val / maxDetrended; 
+    const y = (canvas.height / 2) - (normalized * (canvas.height * 0.4));
     const x = i * step;
+    
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   }
